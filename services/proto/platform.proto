@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package platform;
+
+option go_package = "joint-purchases/core-go/proto;proto";
+
+service CatalogService {
+  rpc GetProductDetails (ProductRequest) returns (ProductResponse);
+  rpc AddProduct (AddProductRequest) returns (AddProductResponse); // 🌟 Добавлен метод создания
+}
+
+message ProductRequest {
+  string product_id = 1;
+}
+
+message ProductResponse {
+  string product_id = 1;
+  string title = 2;
+  string jsonb_attributes = 3;
+}
+
+message AddProductRequest {
+  string product_id = 1;
+  string title = 2;
+  string owner_id = 3;
+  string jsonb_attributes = 4;
+}
+
+message AddProductResponse {
+  bool success = 1;
+  string message = 2;
+}

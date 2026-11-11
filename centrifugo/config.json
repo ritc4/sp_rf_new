@@ -1,0 +1,14 @@
+{
+  "token_hmac_secret_key": "centrifugo_secret_key_2026_top_level",
+  "allowed_origins": ["http://localhost:3000"],
+  "presence": true,
+  "join_leave": true,
+  "engine": "redis",
+  "redis_address": "redis://dragonfly:6379/0",
+  "namespaces": [
+    {
+      "name": "live-updates",
+      "allow_subscribe_for_client": true
+    }
+  ]
+}

@@ -1,0 +1,169 @@
+services:
+  # 1. API Шлюз KrakenD
+  krakend:
+    image: devopsfaith/krakend:2.6
+    volumes:
+      - ./krakend:/etc/krakend
+    ports:
+      - "8080:8080"
+    command: ["run", "-c", "/etc/krakend/krakend.json"]
+    networks:
+      - platform-network
+    depends_on:
+      - core-go
+
+  # 2. Фронтенд на Qwik City
+  qwik-app:
+    build:
+      context: .
+      dockerfile: ./qwik-app/Dockerfile
+    ports:
+      - "3000:3000"
+      - "5173:5173"
+    volumes:
+      - ./qwik-app:/app
+      - qwik_node_modules:/app/node_modules
+    environment:
+      - NODE_ENV=development
+    networks:
+      - platform-network
+    depends_on:
+      - krakend
+
+  # 3. Микросервис CORE (Go 1.26+)
+  core-go:
+    build:
+      context: .
+      dockerfile: ./services/core-go/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      - JWT_SECRET=my_super_secret_key_2026_enterprise_top_level
+      - YUGABYTE_DB_URL=postgres://yugabyte:yugabyte@yugabytedb:5433/yugabyte
+      - DRAGONFLY_URL=dragonfly:6379
+      - REDPANDA_BROKERS=redpanda:9092
+      - GOPROXY=direct
+    networks:
+      - platform-network
+    depends_on:
+      - yugabytedb
+      - dragonfly
+      - redpanda
+
+  # 4. Микросервис DATA (Python 3.14+)
+  data-python:
+    build:
+      context: . 
+      dockerfile: ./services/data-python/Dockerfile
+    ports:
+      - "50051:50051"
+    environment:
+      # 🌟 ИСПРАВЛЕНИЕ: Направляем в стандартную базу yugabyte
+      - DATABASE_URL=postgresql://yugabyte:yugabyte@yugabytedb:5433/yugabyte
+    networks:
+      - platform-network
+    depends_on:
+      - yugabytedb
+
+  # 5. Real-Time Push Сервер Centrifugo
+  centrifugo:
+    image: centrifugo/centrifugo:v5
+    volumes:
+      - ./centrifugo:/centrifugo
+    ports:
+      - "8000:8000"
+    command: centrifugo --config=config.json
+    networks:
+      - platform-network
+    depends_on:
+      - redpanda
+
+  # 6. Событийная шина Redpanda (Kafka-контур)
+  # 6. Событийная шина Redpanda (Kafka-контур)
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command: [
+      "redpanda", "start",
+      "--mode", "dev-container",
+      "--kafka-addr", "internal://0.0.0.0:9092,external://0.0.0.0:19092",
+      "--advertise-kafka-addr", "internal://redpanda:9092,external://localhost:19092",
+      # 🛠 ДОБАВЛЕНО: жестко ограничиваем использование ядер и памяти брокером
+      "--smp", "1",
+      "--memory", "768M"
+    ]
+    ports:
+      - "19092:19092"
+    networks:
+      - platform-network
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # 7. Распределенная NewSQL база данных YugabyteDB
+  yugabytedb:
+    image: yugabytedb/yugabyte:latest
+    # 🛠 ИСПРАВЛЕНО: добавляем флаги урезания памяти для Master и TServer
+    command: [ 
+      "/home/yugabyte/bin/yugabyted", "start", 
+      "--daemon=false",
+      "--master_flags=memory_limit_hard_bytes=536870912",
+      "--tserver_flags=memory_limit_hard_bytes=536870912"
+    ]
+    ports:
+      - "7000:7000"
+      - "5433:5433"
+    networks:
+      - platform-network
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g # Больше база не заберет
+
+  # 8. Кэш-движок Dragonfly
+  dragonfly:
+    # ИСПРАВЛЕНО: Изменен устаревший хост реестра на актуальный GitHub Packages
+    image: ghcr.io/dragonflydb/dragonfly:latest
+    ports:
+      - "6379:6379"
+    command: ["dragonfly", "--proactor_threads=2"]
+    networks:
+      - platform-network
+
+  # 🌟 9. ТАКТИЧЕСКИЙ CDC СЛОЙ: Redpanda Connect
+  redpanda-connect:
+    image: docker.redpanda.com/redpandadata/connect:latest
+    container_name: redpanda-connect
+    volumes:
+      - ./services/redpanda-connect:/etc/redpanda-connect
+    command: [ "run", "/etc/redpanda-connect/config.yaml" ]
+    networks:
+      - platform-network
+    deploy:
+      resources:
+        limits:
+          memory: 150m
+    depends_on:
+      - redpanda
+      - yugabytedb
+  
+  # 10. Асинхронный franz-go инвалидатор кэша
+  cache-worker:
+    build:
+      context: .
+      dockerfile: ./services/cache-worker/Dockerfile
+    environment:
+      - DRAGONFLY_URL=dragonfly:6379
+      - REDPANDA_BROKERS=redpanda:9092
+    networks:
+      - platform-network
+    depends_on:
+      - redpanda
+      - dragonfly
+
+volumes:
+  qwik_node_modules:
+
+networks:
+  platform-network:
+    driver: bridge
