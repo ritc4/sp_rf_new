@@ -1,0 +1,86 @@
+{
+  "$schema": "https://krakend.io",
+  "version": 3,
+  "port": 8080,
+  "timeout": "8s",
+  "cache_ttl": "0s",
+  "extra_config": {
+    "security/cors": {
+      "allow_origins": ["http://localhost:3000"],
+      "allow_methods": ["POST", "GET", "OPTIONS"],
+      "allow_headers": [
+        "Origin", "Authorization", "Content-Type", "Cookie", "Accept",
+        "Connect-Protocol-Version", "Connect-Timeout-Ms", "traceparent", "tracestate"
+      ],
+      "expose_headers": ["Content-Length", "X-Cache"],
+      "allow_credentials": true,
+      "max_age": "12h"
+    },
+    "telemetry/opentelemetry": {
+      "service_name": "krakend-gateway",
+      "metric_reporting_period": 1,
+      "exporters": {
+        "otlp": [{ "name": "grafana-lgtm", "host": "otel-lgtm", "port": 4317, "use_http": false }]
+      }
+    }
+  },
+  "endpoints": [
+    {
+      "endpoint": "/api/auth/register",
+      "method": "POST",
+      "output_encoding": "json",
+      "input_headers": ["Content-Type", "traceparent", "tracestate"],
+      "backend": [{ "url_pattern": "/auth/register", "method": "POST", "host": ["http://core-go:8081"] }]
+    },
+    {
+      "endpoint": "/api/auth/login",
+      "method": "POST",
+      "output_encoding": "json",
+      "input_headers": ["Content-Type", "Cookie", "Accept", "traceparent", "tracestate"],
+      "output_headers": ["Set-Cookie"],
+      "backend": [{ "url_pattern": "/auth/login", "method": "POST", "host": ["http://core-go:8081"] }]
+    },
+    {
+      "endpoint": "/api/auth/refresh",
+      "method": "POST",
+      "output_encoding": "json",
+      "input_headers": ["Cookie", "Content-Type", "Authorization", "traceparent", "tracestate"],
+      "output_headers": ["Set-Cookie"],
+      "backend": [{ "url_pattern": "/auth/refresh", "method": "POST", "host": ["http://core-go:8081"] }]
+    },
+    {
+      "endpoint": "/api/auth/logout",
+      "method": "POST",
+      "output_encoding": "json",
+      "input_headers": ["Cookie", "Content-Type", "Authorization", "traceparent", "tracestate"],
+      "output_headers": ["Set-Cookie"],
+      "backend": [{ "url_pattern": "/auth/logout", "method": "POST", "host": ["http://core-go:8081"] }]
+    },
+    {
+      "endpoint": "/rpc/platform.CatalogService/{method}",
+      "method": "POST",
+      "output_encoding": "no-op",
+      "input_headers": [
+        "Authorization", "Content-Type", "Connect-Protocol-Version",
+        "Connect-Timeout-Ms", "traceparent", "tracestate"
+      ],
+      "extra_config": {
+        "qos/ratelimit/router": { "max_rate": 20.0, "capacity": 20.0 },
+        "auth/validator": {
+          "alg": "HS256",
+          "jwk_local_path": "/etc/krakend/jwk.json",
+          "disable_jwk_security": true,
+          "propagate_claims": [["user_id", "X-User-ID"]]
+        }
+      },
+      "backend": [
+        {
+          "url_pattern": "/platform.CatalogService/{method}",
+          "method": "POST",
+          "encoding": "no-op",
+          "host": ["http://core-go:8082"]
+        }
+      ]
+    }
+  ]
+}

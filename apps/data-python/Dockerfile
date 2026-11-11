@@ -8,12 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Зависимости (копируем и ставим отдельно, чтобы не пересобирать их при изменении кода)
-COPY services/data-python/requirements.txt .
+COPY apps/data-python/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 2. Копируем исходный код микросервиса и gRPC контракты
-COPY services/data-python/app/ .
-COPY services/proto/ ./proto/
+COPY apps/data-python/app/ .
+COPY packages/proto/ ./proto/
 
 # 🌟 ГЕНЕРАЦИЯ: Файлы platform_pb2.py создаются прямо в корне /app/
 RUN python -m grpc_tools.protoc -Iproto --python_out=. --grpc_python_out=. proto/platform.proto

@@ -12,29 +12,23 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
-// Чистая структура самого товара для витрины кэша
 type ProductModel struct {
 	ID              string          `json:"id"`
 	Title           string          `json:"title"`
 	OwnerID         string          `json:"owner_id"`
-	JsonbAttributes json.RawMessage `json:"jsonb_attributes"` // Использование RawMessage предотвратит искажение JSONB
+	JsonbAttributes json.RawMessage `json:"jsonb_attributes"`
 }
 
-// Универсальная структура, поддерживающая и Debezium-обертку, и прямой плоский JSON
 type SmartCDCPayload struct {
-	// Для формата Debezium
 	Payload struct {
 		After ProductModel `json:"after"`
 	} `json:"payload"`
-	
-	// Для прямого плоского JSON от Redpanda Connect
 	ProductModel
 }
 
 func main() {
 	ctx := context.Background()
 
-	// 1. Подключаемся к Dragonfly
 	rdb := redis.NewClient(&redis.Options{
 		Addr: os.Getenv("DRAGONFLY_URL"),
 	})
@@ -42,7 +36,6 @@ func main() {
 		log.Fatalf("Воркер не смог подключиться к Dragonfly: %v", err)
 	}
 
-	// 2. Инициализируем высокопроизводительный клиент franz-go для Redpanda
 	brokers := []string{os.Getenv("REDPANDA_BROKERS")}
 	topic := "yugabyte.catalog_db.public.products"
 
@@ -56,9 +49,8 @@ func main() {
 	}
 	defer cl.Close()
 
-	log.Println("🚀 Ультрасовременный CDC Кэш-Воркер на franz-go запущен. Слушаю Redpanda...")
+	log.Println("🚀 CDC Кэш-Воркер на franz-go запущен. Обновляю кэш Dragonfly из Redpanda...")
 
-	// 3. Бесконечный цикл чтения пакетов событий
 	for {
 		fetches := cl.PollFetches(ctx)
 		if errs := fetches.Errors(); len(errs) > 0 {
@@ -66,7 +58,6 @@ func main() {
 			continue
 		}
 
-		// Обрабатываем полученные записи
 		iter := fetches.RecordIter()
 		for !iter.Done() {
 			record := iter.Next()
@@ -77,7 +68,6 @@ func main() {
 				continue
 			}
 
-			// Умное извлечение модели: если после Debezium пусто — берем корень (Redpanda Connect)
 			var targetProduct ProductModel
 			if event.Payload.After.ID != "" {
 				targetProduct = event.Payload.After
@@ -86,23 +76,29 @@ func main() {
 			}
 
 			if targetProduct.ID == "" {
-				continue // Пропускаем пустые события или операции DELETE
+				continue
 			}
 
-			// Формируем строгий валидный JSON-слепок товара
-			cachedData, err := json.Marshal(targetProduct)
+			// Формируем структуру для кэша (синхронизировано с core-go)
+			cachePayload := map[string]interface{}{
+				"product_id":       targetProduct.ID,
+				"title":            targetProduct.Title,
+				"owner_id":         targetProduct.OwnerID,
+				"jsonb_attributes": string(targetProduct.JsonbAttributes),
+			}
+
+			cachedData, err := json.Marshal(cachePayload)
 			if err != nil {
 				log.Printf("Ошибка маршаллинга структуры товара: %v", err)
 				continue
 			}
 
-			// ⚡ МГНОВЕННАЯ ИНВАЛИДАЦИЯ: Записываем данные в Dragonfly
+			// Обновляем кэш в Dragonfly
 			cacheKey := fmt.Sprintf("catalog:product:%s", targetProduct.ID)
-			err = rdb.Set(ctx, cacheKey, cachedData, 24*time.Hour).Err()
-			if err != nil {
+			if err := rdb.Set(ctx, cacheKey, cachedData, 24*time.Hour).Err(); err != nil {
 				log.Printf("Ошибка обновления кэша в Dragonfly: %v", err)
 			} else {
-				log.Printf("⚡ CDC Магия [franz-go]: Кэш для товара %s обновлен в Dragonfly напрямую из WAL-лога БД!", targetProduct.ID)
+				log.Printf("⚡ CDC [franz-go]: Кэш для товара %s успешно обновлен в Dragonfly!", targetProduct.ID)
 			}
 		}
 	}

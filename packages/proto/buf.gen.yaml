@@ -1,0 +1,6 @@
+version: v2
+plugins:
+  # Генерация строго типизированного клиента Connect-RPC для Qwik (TypeScript)
+  - remote: buf.build/bufbuild/es
+    out: ../../apps/web-qwik/src/gen
+    opt: target=ts

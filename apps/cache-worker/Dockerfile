@@ -5,13 +5,13 @@ RUN apk add --no-cache protobuf-dev protoc git
 WORKDIR /app
 
 # 🌟 Сначала копируем только файлы модулей для кэширования слоев Docker
-COPY services/cache-worker/go.mod services/cache-worker/go.sum ./
+COPY apps/cache-worker/go.mod apps/cache-worker/go.sum ./
 
 # Скачиваем зависимости (этот слой закэшируется и будет выполняться мгновенно)
 RUN go mod download
 
 # Копируем остальной исходный код (main.go)
-COPY services/cache-worker/ .
+COPY apps/cache-worker/ .
 
 # 🌟 Накатываем и фиксируем все зависимости прямо внутри контейнера
 RUN go mod tidy

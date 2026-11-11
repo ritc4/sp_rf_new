@@ -1,0 +1,35 @@
+// 1. Находим все запущенные Docker-контейнеры на сервере
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// 2. Извлекаем понятные имена сервисов и контейнеров для удобного поиска в Grafana
+discovery.relabel "docker_logs" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service_name"
+  }
+}
+
+// 3. Читаем stdout/stderr всех найденных контейнеров
+loki.source.docker "default" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.relabel.docker_logs.output
+  relabel_rules = discovery.relabel.docker_logs.rules
+  forward_to    = [loki.write.local_loki.receiver]
+}
+
+// 4. Отправляем собранные логи во встроенный Loki внутри otel-lgtm
+loki.write "local_loki" {
+  endpoint {
+    url = "http://otel-lgtm:3100/loki/api/v1/push"
+  }
+}

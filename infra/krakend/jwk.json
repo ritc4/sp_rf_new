@@ -1,0 +1,10 @@
+{
+  "keys": [
+    {
+      "kty": "oct",
+      "alg": "HS256",
+      "k": "bXlfc3VwZXJfc2VjcmV0X2tleV8yMDI2X2VudGVycHJpc2VfdG9wX2xldmVs",
+      "kid": "core-go-hs256-key"
+    }
+  ]
+}

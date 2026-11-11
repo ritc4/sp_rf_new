@@ -1,5 +1,6 @@
 {
   "token_hmac_secret_key": "centrifugo_secret_key_2026_top_level",
+  "api_key": "centrifugo_api_key_2026_secret",
   "allowed_origins": ["http://localhost:3000"],
   "presence": true,
   "join_leave": true,
@@ -8,6 +9,7 @@
   "namespaces": [
     {
       "name": "live-updates",
+      "anonymous": true,
       "allow_subscribe_for_client": true
     }
   ]

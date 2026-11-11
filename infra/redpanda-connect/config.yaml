@@ -1,0 +1,54 @@
+input:
+  postgres_cdc:
+    # Направляем коннектор строго в изолированную базу данных Python
+    dsn: "postgres://yugabyte:yugabyte@yugabytedb:5433/catalog_db?sslmode=disable"
+    # Уникальное имя слота логической репликации для каталога
+    slot_name: "rp_connect_catalog_slot"
+    # Слушаем и таблицу товаров (для кэша), и таблицу Outbox (для live-пушей)
+    tables:
+      - "public.products"
+      - "public.outbox_events"
+    # Делаем слепок существующих товаров при первом запуске
+    stream_snapshot: true
+
+pipeline:
+  processors:
+    - mapping: |
+        # Сохраняем имя исходной таблицы в метаданные сообщения
+        meta table = @table
+
+output:
+  broker:
+    pattern: fan_out
+    outputs:
+      # Поток 1: Все изменения товаров отправляем в Redpanda для инвалидации кэша в Go
+      - redpanda:
+          addresses: [ "redpanda:9092" ]
+          topic: "yugabyte.catalog_db.public.products"
+        processors:
+          - mapping: |
+              # Пропускаем в этот топик только события из таблицы products
+              root = if meta("table") == "products" { this } else { deleted() }
+
+      # Поток 2: События из Transactional Outbox пушим напрямую в Centrifugo по HTTP API
+      - http_client:
+          url: "http://centrifugo:8000/api"
+          verb: POST
+          headers:
+            Content-Type: "application/json"
+            # Замените на ваш api_key из centrifugo/config.json
+            X-API-Key: "${CENTRIFUGO_API_KEY:centrifugo_api_key_2026_secret}"
+        processors:
+          - mapping: |
+              # Обрабатываем только вставки в таблицу outbox_events
+              root = if meta("table") == "outbox_events" {
+                {
+                  "method": "publish",
+                  "params": {
+                    "channel": this.channel.or("live-updates:products"),
+                    "data": this.payload.parse_json().catch(this.payload)
+                  }
+                }
+              } else {
+                deleted()
+              }
