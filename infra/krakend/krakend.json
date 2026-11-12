@@ -1,6 +1,6 @@
 {
   "$schema": "https://krakend.io",
-  "version": 3,
+  "version": 4,
   "port": 8080,
   "timeout": "8s",
   "cache_ttl": "0s",

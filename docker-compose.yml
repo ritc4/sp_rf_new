@@ -110,25 +110,41 @@ services:
         limits:
           memory: 1g
 
-  # 7. Распределенная NewSQL база данных YugabyteDB
+  # # 7. Распределенная NewSQL база данных YugabyteDB
+  # yugabytedb:
+  #   image: yugabytedb/yugabyte:2024.2.1.0-b185
+  #   container_name: yugabytedb
+  #   command: [
+  #     "/home/yugabyte/bin/yugabyted", "start",
+  #     "--daemon=false",
+  #     "--master_flags=memory_limit_hard_bytes=536870912",
+  #     "--tserver_flags=memory_limit_hard_bytes=536870912"
+  #   ]
+  #   ports:
+  #     - "7000:7000"
+  #     - "5433:5433"
+  #   networks:
+  #     - platform-network
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 1.5g
+
+
+  # 7. Легкая PostgreSQL 17 с включенным CDC (wal_level=logical) вместо тяжелой YugabyteDB для разработки
   yugabytedb:
-    image: yugabytedb/yugabyte:2024.2.1.0-b185
+    image: postgres:17-alpine
     container_name: yugabytedb
-    command: [
-      "/home/yugabyte/bin/yugabyted", "start",
-      "--daemon=false",
-      "--master_flags=memory_limit_hard_bytes=536870912",
-      "--tserver_flags=memory_limit_hard_bytes=536870912"
-    ]
+    environment:
+      - POSTGRES_USER=yugabyte
+      - POSTGRES_PASSWORD=yugabyte
+      - POSTGRES_DB=yugabyte
+    command: ["postgres", "-p", "5433", "-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
     ports:
-      - "7000:7000"
       - "5433:5433"
     networks:
       - platform-network
-    deploy:
-      resources:
-        limits:
-          memory: 1.5g
+    restart: on-failure
 
   # 8. Кэш-движок Dragonfly
   dragonfly:
