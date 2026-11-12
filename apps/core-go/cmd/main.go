@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"connectrpc.com/connect"
@@ -63,17 +64,18 @@ var (
 	requestGroup singleflight.Group
 )
 
-// CatalogServer реализует бинарный контракт Connect-RPC для основного трафика
+// CatalogServer реализует бинарный контракт Connect-RPC (BFF-слой перед изолированным data-python)
 type CatalogServer struct{}
 
-func (s *CatalogServer) GetProductDetails(ctx context.Context, req *connect.Request[pb.ProductRequest]) (*connect.Response[pb.ProductResponse], error) {
+func (s *CatalogServer) GetProduct(ctx context.Context, req *connect.Request[pb.ProductRequest]) (*connect.Response[pb.ProductResponse], error) {
 	id := req.Msg.ProductId
 	cacheKey := fmt.Sprintf("catalog:product:%s", id)
 
-	// 1. Быстрое чтение из Dragonfly
+	// 1. Быстрое чтение из Dragonfly (прогретого через Redpanda Connect CDC или прошлым запросом)
 	if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
 		var resp pb.ProductResponse
 		if json.Unmarshal([]byte(cached), &resp) == nil {
+			resp.Source = "dragonfly-cache"
 			res := connect.NewResponse(&resp)
 			res.Header().Set("X-Cache", "HIT")
 			return res, nil
@@ -85,6 +87,7 @@ func (s *CatalogServer) GetProductDetails(ctx context.Context, req *connect.Requ
 		if freshCache, cacheErr := rdb.Get(ctxBg, cacheKey).Result(); cacheErr == nil {
 			var resp pb.ProductResponse
 			if json.Unmarshal([]byte(freshCache), &resp) == nil {
+				resp.Source = "dragonfly-cache"
 				return &resp, nil
 			}
 		}
@@ -93,19 +96,19 @@ func (s *CatalogServer) GetProductDetails(ctx context.Context, req *connect.Requ
 		grpcCtx, cancel := context.WithTimeout(detachedCtx, 5*time.Second)
 		defer cancel()
 
-		resp, grpcErr := grpcClient.GetProductDetails(grpcCtx, req.Msg)
+		resp, grpcErr := grpcClient.GetProduct(grpcCtx, req.Msg)
 		if grpcErr != nil {
 			return nil, grpcErr
 		}
 
 		if data, mErr := json.Marshal(resp); mErr == nil {
-			_ = rdb.Set(ctxBg, cacheKey, data, 1*time.Hour).Err()
+			_ = rdb.Set(ctxBg, cacheKey, data, 24*time.Hour).Err()
 		}
 		return resp, nil
 	})
 
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
+		return nil, connect.NewError(connect.CodeNotFound, err)
 	}
 
 	res := connect.NewResponse(v.(*pb.ProductResponse))
@@ -113,11 +116,30 @@ func (s *CatalogServer) GetProductDetails(ctx context.Context, req *connect.Requ
 	return res, nil
 }
 
+// extractUserIDFromHeader извлекает ID пользователя из X-User-ID (от KrakenD) или напрямую из Bearer JWT
+func extractUserIDFromHeader(header http.Header) string {
+	if uid := header.Get("X-User-ID"); uid != "" {
+		return uid
+	}
+	authHeader := header.Get("Authorization")
+	if strings.HasPrefix(authHeader, "Bearer ") {
+		rawToken := strings.TrimPrefix(authHeader, "Bearer ")
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(rawToken, claims, func(t *jwt.Token) (any, error) {
+			return jwtSecret, nil
+		})
+		if err == nil && token.Valid && claims.UserID != "" {
+			return claims.UserID
+		}
+	}
+	return ""
+}
+
 func (s *CatalogServer) AddProduct(ctx context.Context, req *connect.Request[pb.AddProductRequest]) (*connect.Response[pb.AddProductResponse], error) {
-	// Доверяем заголовку X-User-ID, который KrakenD проставил после проверки JWT
-	userID := req.Header().Get("X-User-ID")
+	// Zero-Trust: определяем владельца строго из проверенного токена, игнорируя подделки с клиента
+	userID := extractUserIDFromHeader(req.Header())
 	if userID == "" {
-		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing X-User-ID header"))
+		return nil, connect.NewError(connect.CodeUnauthenticated, fmt.Errorf("missing or invalid user identity"))
 	}
 	req.Msg.OwnerId = userID
 
@@ -184,8 +206,20 @@ func generateTokenPair(userID string) (string, string, error) {
 	return accessToken, refreshToken, nil
 }
 
+func generateCentrifugoToken(userID string) (string, error) {
+	secret := os.Getenv("CENTRIFUGO_SECRET")
+	if secret == "" {
+		secret = "centrifugo_secret_key_2026_top_level"
+	}
+	claims := jwt.MapClaims{
+		"sub": userID,
+		"exp": time.Now().Add(24 * time.Hour).Unix(),
+	}
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString([]byte(secret))
+}
+
 func main() {
-	// Запускаем телеметрию OpenTelemetry с безопасным таймаутом при завершении
 	shutdown := initTracer()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -195,7 +229,10 @@ func main() {
 		}
 	}()
 
-	systemDSN := "postgres://yugabyte:yugabyte@yugabytedb:5433/yugabyte"
+	systemDSN := os.Getenv("YUGABYTE_DB_URL")
+	if systemDSN == "" {
+		systemDSN = "postgres://yugabyte:yugabyte@yugabytedb:5433/yugabyte"
+	}
 	var err error
 
 	for i := 0; i < 15; i++ {
@@ -240,9 +277,13 @@ func main() {
 		log.Fatalf("Ошибка подключения к Dragonfly: %v", err)
 	}
 
-	// Подключаем gRPC с перехватчиком OpenTelemetry для проброса Trace-ID в Python
+	// Подключаем внутренний gRPC канал к изолированному data-python с OTel-трассировкой
+	dataAddr := os.Getenv("DATA_GRPC_ADDR")
+	if dataAddr == "" {
+		dataAddr = "data-python:50051"
+	}
 	grpcConn, err := grpc.NewClient(
-		"data-python:50051",
+		dataAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)
@@ -257,7 +298,8 @@ func main() {
 		},
 	})
 
-	// Включаем перехват входящих трейсов от шлюза KrakenD
+
+		// Включаем перехват входящих трейсов от шлюза KrakenD
 	app.Use(fiberotel.Middleware())
 
 	app.Post("/auth/register", func(c fiber.Ctx) error {
@@ -300,9 +342,15 @@ func main() {
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid credentials"})
 		}
 
-		accessToken, refreshToken, err := generateTokenPair(fmt.Sprintf("%d", user.ID))
+		userIDStr := fmt.Sprintf("%d", user.ID)
+		accessToken, refreshToken, err := generateTokenPair(userIDStr)
 		if err != nil {
-			return err
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Token generation failed"})
+		}
+
+		centrifugoToken, err := generateCentrifugoToken(userIDStr)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "WS token generation failed"})
 		}
 
 		c.Cookie(&fiber.Cookie{
@@ -315,9 +363,11 @@ func main() {
 			Path:     "/",
 		})
 
-		return c.JSON(fiber.Map{"access_token": accessToken})
+		return c.JSON(fiber.Map{
+			"access_token":     accessToken,
+			"centrifugo_token": centrifugoToken,
+		})
 	})
-
 
 	app.Post("/auth/refresh", func(c fiber.Ctx) error {
 		refreshTokenStr := c.Cookies("refresh_token")
@@ -338,6 +388,11 @@ func main() {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Token generation failed"})
 		}
 
+		newCentrifugoToken, err := generateCentrifugoToken(storedUser)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "WS token generation failed"})
+		}
+
 		c.Cookie(&fiber.Cookie{
 			Name:     "refresh_token",
 			Value:    newRefreshToken,
@@ -348,11 +403,13 @@ func main() {
 			Path:     "/",
 		})
 
-		return c.JSON(fiber.Map{"access_token": newAccessToken})
+		return c.JSON(fiber.Map{
+			"access_token":     newAccessToken,
+			"centrifugo_token": newCentrifugoToken,
+		})
 	})
 
-
-		// Выход
+	// Выход
 	app.Post("/auth/logout", func(c fiber.Ctx) error {
 		refreshTokenStr := c.Cookies("refresh_token")
 		if refreshTokenStr != "" {
@@ -368,7 +425,7 @@ func main() {
 		return c.JSON(fiber.Map{"status": "logged_out"})
 	})
 
-	// 🌟 CQRS ПОТОК ЧТЕНИЯ: Получение товара из Dragonfly с защитой Singleflight
+	// Резервный REST CQRS поток чтения (совместим с новым platform.proto)
 	app.Get("/catalog/product/:id", func(c fiber.Ctx) error {
 		authHeader := c.Get("Authorization")
 		if len(authHeader) < 8 || authHeader[:7] != "Bearer " {
@@ -387,7 +444,6 @@ func main() {
 		id := c.Params("id")
 		cacheKey := fmt.Sprintf("catalog:product:%s", id)
 
-		// 1. Быстрая проверка кэша в Dragonfly
 		cachedProduct, err := rdb.Get(ctxBg, cacheKey).Result()
 		if err == nil {
 			c.Set("X-Cache", "HIT")
@@ -395,19 +451,16 @@ func main() {
 			return c.Status(fiber.StatusOK).SendString(cachedProduct)
 		}
 
-		// 2. Cache MISS: объединяем все одновременные запросы одного товара в один
 		v, err, _ := requestGroup.Do(cacheKey, func() (any, error) {
-			// Повторная проверка: возможно, соседняя горутина уже успела заполнить кэш
 			if freshCache, cacheErr := rdb.Get(ctxBg, cacheKey).Result(); cacheErr == nil {
 				return freshCache, nil
 			}
 
-			// Сохраняем trace_id от c.UserContext(), но защищаем запрос от отмены при закрытии вкладки первым клиентом
-			detachedCtx := context.WithoutCancel(c.UserContext())
+			detachedCtx := context.WithoutCancel(c.Context())
 			grpcCtx, cancel := context.WithTimeout(detachedCtx, 5*time.Second)
 			defer cancel()
 
-			resp, grpcErr := grpcClient.GetProductDetails(grpcCtx, &pb.ProductRequest{ProductId: id})
+			resp, grpcErr := grpcClient.GetProduct(grpcCtx, &pb.ProductRequest{ProductId: id})
 			if grpcErr != nil {
 				return nil, grpcErr
 			}
@@ -416,6 +469,7 @@ func main() {
 				"product_id":       resp.ProductId,
 				"title":            resp.Title,
 				"jsonb_attributes": resp.JsonbAttributes,
+				"source":           resp.Source,
 			}
 
 			actualJSON, marshalErr := json.Marshal(productMap)
@@ -423,12 +477,12 @@ func main() {
 				return nil, marshalErr
 			}
 
-			_ = rdb.Set(ctxBg, cacheKey, actualJSON, 1*time.Hour).Err()
+			_ = rdb.Set(ctxBg, cacheKey, actualJSON, 24*time.Hour).Err()
 			return string(actualJSON), nil
 		})
 
 		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": err.Error()})
 		}
 
 		c.Set("X-Cache", "MISS")
@@ -436,7 +490,7 @@ func main() {
 		return c.Status(fiber.StatusOK).SendString(v.(string))
 	})
 
-	// 🌟 CQRS ПОТОК ЗАПИСИ: Роут добавления нового товара через gRPC в Python контур
+	// Резервный REST CQRS поток записи (совместим с новым platform.proto)
 	app.Post("/catalog/product", func(c fiber.Ctx) error {
 		authHeader := c.Get("Authorization")
 		if len(authHeader) < 8 || authHeader[:7] != "Bearer " {
@@ -462,26 +516,50 @@ func main() {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Bad request body"})
 		}
 
-		// 🌟 ИСПРАВЛЕНИЕ: Передаем c.UserContext() для сквозной трассировки записи в Python
-		grpcCtx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+		grpcCtx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 		defer cancel()
 
 		resp, err := grpcClient.AddProduct(grpcCtx, &pb.AddProductRequest{
 			ProductId:       form.ID,
 			Title:           form.Title,
-			OwnerId:         claims.UserID, 
+			OwnerId:         claims.UserID,
 			JsonbAttributes: form.JsonbAttributes,
 		})
-		if err != nil || !resp.Success {
+		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "gRPC write operation failed"})
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"status":     "product_add_command_dispatched",
-			"product_id": form.ID,
+			"status":     resp.Status,
+			"product_id": resp.ProductId,
 		})
-	}) 
+	})
 
-	// Запуск HTTP сервера
+	// 🌟 ЗАПУСК БИНАРНОГО CONNECT-RPC СЕРВЕРА НА ПОРТУ :8082 (ОСНОВНОЙ ТРАФИК КАТАЛОГА)
+	go func() {
+		mux := http.NewServeMux()
+		otelInterceptor, err := otelconnect.NewInterceptor()
+		if err != nil {
+			log.Fatalf("Ошибка создания OTel перехватчика для Connect-RPC: %v", err)
+		}
+
+		path, handler := protoconnect.NewCatalogServiceHandler(
+			&CatalogServer{},
+			connect.WithInterceptors(otelInterceptor),
+		)
+		mux.Handle(path, handler)
+
+		rpcServer := &http.Server{
+			Addr:    ":8082",
+			Handler: h2c.NewHandler(mux, &http2.Server{}),
+		}
+		log.Println("⚡ Бинарный Connect-RPC BFF сервер запущен на порту :8082 (h2c)")
+		if err := rpcServer.ListenAndServe(); err != nil {
+			log.Fatalf("Ошибка запуска Connect-RPC сервера: %v", err)
+		}
+	}()
+
+	// Запуск REST HTTP сервера (Аутентификация и сессии) на порту :8081
+	log.Println("🔐 REST Auth сервер запущен на порту :8081")
 	log.Fatal(app.Listen(":8081"))
 }

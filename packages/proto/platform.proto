@@ -5,8 +5,8 @@ package platform;
 option go_package = "joint-purchases/core-go/proto;proto";
 
 service CatalogService {
-  rpc GetProductDetails (ProductRequest) returns (ProductResponse);
-  rpc AddProduct (AddProductRequest) returns (AddProductResponse); // 🌟 Добавлен метод создания
+  rpc GetProduct (ProductRequest) returns (ProductResponse);
+  rpc AddProduct (AddProductRequest) returns (AddProductResponse);
 }
 
 message ProductRequest {
@@ -17,6 +17,7 @@ message ProductResponse {
   string product_id = 1;
   string title = 2;
   string jsonb_attributes = 3;
+  string source = 4;
 }
 
 message AddProductRequest {
@@ -27,6 +28,6 @@ message AddProductRequest {
 }
 
 message AddProductResponse {
-  bool success = 1;
-  string message = 2;
+  string status = 1;
+  string product_id = 2;
 }

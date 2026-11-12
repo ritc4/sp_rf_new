@@ -212,13 +212,34 @@ def bootstrap_db():
     logger.critical("Не удалось накатить схему данных: превышено время ожидания YugabyteDB.")
     sys.exit(1)
 
+def db_cleanup_old_outbox():
+    """Удаляет обработанные события Outbox старше 24 часов."""
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM outbox_events WHERE created_at < NOW() - INTERVAL '24 hours';")
+            if cur.rowcount > 0:
+                logger.info(f"🧹 Outbox GC: удалено {cur.rowcount} устаревших событий.")
+    except Exception as e:
+        logger.error(f"Ошибка очистки outbox_events: {e}")
+    finally:
+        conn.close()
+
+
+async def cleanup_outbox_loop():
+    """Фоновый цикл очистки таблицы Outbox каждый час."""
+    while True:
+        await asyncio.sleep(3600)
+        await asyncio.to_thread(db_cleanup_old_outbox)
 
 async def serve():
     bootstrap_db()
+    asyncio.create_task(cleanup_outbox_loop())
     server = grpc.aio.server()
     pb2_grpc.add_CatalogServiceServicer_to_server(CatalogService(), server)
     server.add_insecure_port("[::]:50051")
-    logger.info("🚀 Чистый асинхронный gRPC Python сервер запущен на порту :50051")
+    logger.info("🚀 Изолированный gRPC Python сервер запущен на порту :50051")
     await server.start()
     await server.wait_for_termination()
 

@@ -1,7 +1,7 @@
 services:
   # 1. API Шлюз KrakenD
   krakend:
-    image: devopsfaith/krakend:2.6
+    image: krakend:3.0.3
     container_name: krakend
     volumes:
       - ./infra/krakend:/etc/krakend
@@ -14,7 +14,7 @@ services:
       - core-go
     restart: on-failure
 
-  # 2. Фронтенд на Qwik City (собранный бандл + сгенерированный Connect-RPC клиент)
+  # 2. Фронтенд на Qwik City
   web-qwik:
     build:
       context: .
@@ -30,7 +30,7 @@ services:
       - krakend
     restart: on-failure
 
-  # 3. Микросервис CORE (Go 1.26+ REST Auth + Connect-RPC Catalog)
+  # 3. Микросервис CORE (Единый BFF-шлюз, Auth, Singleflight, Cache Read, JWT для Centrifugo)
   core-go:
     build:
       context: .
@@ -42,9 +42,9 @@ services:
     environment:
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-lgtm:4317
       - JWT_SECRET=my_super_secret_key_2026_enterprise_top_level
+      - CENTRIFUGO_SECRET=centrifugo_secret_key_2026_top_level
       - YUGABYTE_DB_URL=postgres://yugabyte:yugabyte@yugabytedb:5433/yugabyte
       - DRAGONFLY_URL=dragonfly:6379
-      - REDPANDA_BROKERS=redpanda:9092
       - DATA_GRPC_ADDR=data-python:50051
       - GOPROXY=direct
     networks:
@@ -52,18 +52,18 @@ services:
     depends_on:
       - yugabytedb
       - dragonfly
-      - redpanda
+      - data-python
       - otel-lgtm
     restart: on-failure
 
-  # 4. Микросервис DATA (Python gRPC + Transactional Outbox)
+  # 4. Микросервис DATA (Изолирован внутри сети без внешнего порта! Только для core-go)
   data-python:
     build:
       context: .
       dockerfile: ./apps/data-python/Dockerfile
     container_name: data-python
-    ports:
-      - "50051:50051"
+    expose:
+      - "50051"
     environment:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-lgtm:4317
       - DATABASE_URL=postgresql://yugabyte:yugabyte@yugabytedb:5433/catalog_db
@@ -74,9 +74,9 @@ services:
       - otel-lgtm
     restart: on-failure
 
-  # 5. Real-Time Push Сервер Centrifugo
+  # 5. Real-Time Push Сервер Centrifugo (Закрытый режим по JWT)
   centrifugo:
-    image: centrifugo/centrifugo:v5
+    image: centrifugo/centrifugo:v5.4.9
     container_name: centrifugo
     volumes:
       - ./infra/centrifugo:/centrifugo
@@ -112,7 +112,7 @@ services:
 
   # 7. Распределенная NewSQL база данных YugabyteDB
   yugabytedb:
-    image: yugabytedb/yugabyte:latest
+    image: yugabytedb/yugabyte:2024.2.1.0-b185
     container_name: yugabytedb
     command: [
       "/home/yugabyte/bin/yugabyted", "start",
@@ -132,7 +132,7 @@ services:
 
   # 8. Кэш-движок Dragonfly
   dragonfly:
-    image: ghcr.io/dragonflydb/dragonfly:latest
+    image: ghcr.io/dragonflydb/dragonfly:v1.26.1
     container_name: dragonfly
     ports:
       - "6379:6379"
@@ -140,7 +140,7 @@ services:
     networks:
       - platform-network
 
-  # 9. Тактический CDC слой: Redpanda Connect (CDC -> Redpanda & Centrifugo)
+  # 9. Единый CDC-конвейер: Redpanda Connect (Dragonfly + Centrifugo + Redpanda)
   redpanda-connect:
     image: docker.redpanda.com/redpandadata/connect:latest
     container_name: redpanda-connect
@@ -162,30 +162,14 @@ services:
       - centrifugo
     restart: on-failure
 
-  # 10. Асинхронный franz-go инвалидатор кэша
-  cache-worker:
-    build:
-      context: .
-      dockerfile: ./apps/cache-worker/Dockerfile
-    container_name: cache-worker
-    environment:
-      - DRAGONFLY_URL=dragonfly:6379
-      - REDPANDA_BROKERS=redpanda:9092
-    networks:
-      - platform-network
-    depends_on:
-      - redpanda
-      - dragonfly
-    restart: on-failure
-
-  # 11. Единый стек наблюдаемости (Loki, Grafana, Tempo, Mimir + OTel Collector)
+  # 10. Единый стек наблюдаемости (Loki, Grafana, Tempo, Mimir + OTel Collector)
   otel-lgtm:
-    image: grafana/otel-lgtm:latest
+    image: grafana/otel-lgtm:0.8.2
     container_name: otel-lgtm
     ports:
-      - "3001:3000" # Веб-интерфейс Grafana (Логин: admin, Пароль: admin)
-      - "4317:4317" # OTLP gRPC приемник трейсов и метрик
-      - "4318:4318" # OTLP HTTP приемник
+      - "3001:3000"
+      - "4317:4317"
+      - "4318:4318"
     networks:
       - platform-network
     deploy:
@@ -193,9 +177,9 @@ services:
         limits:
           memory: 800m
 
-  # 12. Агент-сборщик логов всех контейнеров в Loki
+  # 11. Агент-сборщик логов всех контейнеров в Loki
   alloy:
-    image: grafana/alloy:latest
+    image: grafana/alloy:v1.5.1
     container_name: grafana-alloy
     volumes:
       - ./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro
